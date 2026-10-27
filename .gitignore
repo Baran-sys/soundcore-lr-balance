@@ -6,3 +6,4 @@ venv/
 backup_state.json
 backup_*.json
 p40i_balance.py
+reddit_post_image.png

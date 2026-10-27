@@ -1,27 +1,37 @@
 #!/usr/bin/env python3
 """
-soundcore-balance (p40i_balance.py)
-Hardware-level Left/Right channel balance & per-ear 8-band EQ calibration tool
-for Anker Soundcore earbuds (P40i, Liberty 4, Liberty 4 NC, Space A40, Life P3, etc.).
+soundcore-balance
+Cross-platform (Linux, Windows, macOS) hardware-level Left/Right channel balance
+and per-ear 8-band EQ calibrator for Anker Soundcore earbuds.
 
 Writes independent Left and Right channel gains directly into the earbuds'
 onboard non-volatile DSP memory (via Soundcore RFCOMM protocol command 0x03 0x87),
-so the balance fix persists across ALL connected devices (Phone, PC, TV, Console).
+so the balance compensation persists across all connected devices.
 """
 
 import argparse
+import glob
 import json
 import math
 import os
+import platform
 import re
-import select
 import socket
 import subprocess
 import sys
-import termios
 import time
-import tty
 from typing import Dict, List, Optional, Tuple
+
+IS_WINDOWS = platform.system() == "Windows"
+IS_MACOS = platform.system() == "Darwin"
+IS_LINUX = platform.system() == "Linux"
+
+if IS_WINDOWS:
+    import ctypes
+    import msvcrt
+else:
+    import termios
+    import tty
 
 BAND_LABELS = ["100Hz", "200Hz", "400Hz", "800Hz", "1.6kHz", "3.2kHz", "6.4kHz", "12.8kHz"]
 SOUNDCORE_KEYWORDS = (
@@ -39,10 +49,92 @@ SOUNDCORE_KEYWORDS = (
     "a3953",
     "a3947",
     "a3936",
+    "a3954",
+    "a3957",
+    "a3952",
+    "a3951",
+    "a3959",
+    "a3968",
 )
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_BACKUP_FILE = os.path.join(BASE_DIR, "backup_state.json")
+
+
+def enable_windows_ansi() -> None:
+    """Enable VT100 ANSI escape sequences on Windows 10/11 consoles."""
+    if not IS_WINDOWS:
+        return
+    try:
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
+        mode = ctypes.c_ulong()
+        if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            kernel32.SetConsoleMode(handle, mode.value | 0x0004)
+    except Exception:
+        pass
+
+
+class SoundcoreTransport:
+    """Unified wrapper over a Bluetooth RFCOMM socket (Linux/Windows) or /dev/cu.* serial device (macOS/COM)."""
+
+    def __init__(self, sock: Optional[socket.socket] = None, fd: Optional[int] = None, label: str = ""):
+        self.sock = sock
+        self.fd = fd
+        self.label = label
+
+    def sendall(self, data: bytes) -> None:
+        if self.sock is not None:
+            self.sock.sendall(data)
+        elif self.fd is not None:
+            os.write(self.fd, data)
+
+    def recv(self, bufsize: int = 1024, timeout: float = 2.0) -> bytes:
+        if self.sock is not None:
+            self.sock.settimeout(timeout)
+            return self.sock.recv(bufsize)
+        elif self.fd is not None:
+            if not IS_WINDOWS:
+                import select
+
+                r, _, _ = select.select([self.fd], [], [], timeout)
+                if not r:
+                    raise TimeoutError("Timed out reading from serial device")
+            chunks = bytearray()
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                if not IS_WINDOWS:
+                    import select
+
+                    r, _, _ = select.select([self.fd], [], [], 0.15)
+                    if not r:
+                        if len(chunks) >= 10:
+                            break
+                        continue
+                chunk = os.read(self.fd, bufsize)
+                if not chunk:
+                    break
+                chunks.extend(chunk)
+                if len(chunks) >= 9:
+                    expected_len = int.from_bytes(chunks[7:9], "little")
+                    if len(chunks) >= expected_len:
+                        break
+            return bytes(chunks)
+        raise RuntimeError("Transport is not connected")
+
+    def close(self) -> None:
+        if self.sock is not None:
+            try:
+                self.sock.close()
+            except Exception:
+                pass
+            self.sock = None
+        if self.fd is not None:
+            try:
+                os.close(self.fd)
+            except Exception:
+                pass
+            self.fd = None
 
 
 def apply_drc(adj_10: List[int]) -> List[int]:
@@ -90,33 +182,73 @@ def make_packet(cmd: Tuple[int, int], body: List[int]) -> bytes:
 
 
 def discover_soundcore_device() -> Optional[Tuple[str, str]]:
-    """Auto-detect connected Soundcore Bluetooth device via bluetoothctl."""
-    try:
-        res = subprocess.run(
-            ["bluetoothctl", "devices", "Connected"],
-            capture_output=True,
-            text=True,
-            timeout=3,
-        )
-        lines = res.stdout.strip().splitlines()
-        if not lines:
+    """Auto-detect connected Soundcore Bluetooth device on Linux, Windows, or macOS."""
+    # 1. Linux: bluetoothctl
+    if IS_LINUX:
+        for subcmd in (["bluetoothctl", "devices", "Connected"], ["bluetoothctl", "devices", "Paired"]):
+            try:
+                res = subprocess.run(subcmd, capture_output=True, text=True, timeout=3)
+                for line in res.stdout.strip().splitlines():
+                    m = re.match(r"^Device\s+([0-9A-Fa-f:]{17})\s+(.+)$", line.strip())
+                    if m:
+                        mac, name = m.group(1), m.group(2)
+                        if any(k in name.lower() for k in SOUNDCORE_KEYWORDS):
+                            return mac, name
+            except Exception:
+                pass
+
+    # 2. Windows: PowerShell Get-PnpDevice
+    if IS_WINDOWS:
+        try:
+            ps_cmd = (
+                "Get-PnpDevice -Class Bluetooth | Where-Object {$_.Status -eq 'OK'} | "
+                "Select-Object -Property FriendlyName, InstanceId | ConvertTo-Json"
+            )
             res = subprocess.run(
-                ["bluetoothctl", "devices", "Paired"],
+                ["powershell", "-NoProfile", "-Command", ps_cmd],
                 capture_output=True,
                 text=True,
-                timeout=3,
+                timeout=5,
             )
-            lines = res.stdout.strip().splitlines()
-
-        for line in lines:
-            m = re.match(r"^Device\s+([0-9A-Fa-f:]{17})\s+(.+)$", line.strip())
-            if m:
-                mac, name = m.group(1), m.group(2)
+            items = json.loads(res.stdout) if res.stdout.strip() else []
+            if isinstance(items, dict):
+                items = [items]
+            for item in items:
+                name = str(item.get("FriendlyName") or "")
+                inst = str(item.get("InstanceId") or "")
                 if any(k in name.lower() for k in SOUNDCORE_KEYWORDS):
-                    return mac, name
-    except Exception:
-        pass
+                    m = re.search(r"([0-9A-Fa-f]{12})", inst)
+                    if m:
+                        raw_hex = m.group(1).upper()
+                        mac = ":".join(raw_hex[i : i + 2] for i in range(0, 12, 2))
+                        return mac, name
+        except Exception:
+            pass
 
+    # 3. macOS: /dev/cu.* serial device nodes or system_profiler
+    if IS_MACOS:
+        for path in sorted(glob.glob("/dev/cu.*")):
+            base = os.path.basename(path).lower()
+            if any(k.replace(" ", "") in base.replace("-", "").replace("_", "") for k in SOUNDCORE_KEYWORDS):
+                return path, os.path.basename(path)
+        try:
+            res = subprocess.run(
+                ["system_profiler", "SPBluetoothDataType"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            blocks = res.stdout.split("\n\n")
+            for b in blocks:
+                if any(k in b.lower() for k in SOUNDCORE_KEYWORDS):
+                    m = re.search(r"Address:\s*([0-9A-Fa-f:-]{17})", b)
+                    if m:
+                        mac = m.group(1).replace("-", ":").upper()
+                        return mac, "Soundcore Device"
+        except Exception:
+            pass
+
+    # 4. Fallback to saved backup_state.json
     if os.path.exists(DEFAULT_BACKUP_FILE):
         try:
             with open(DEFAULT_BACKUP_FILE, "r") as f:
@@ -128,13 +260,50 @@ def discover_soundcore_device() -> Optional[Tuple[str, str]]:
     return None
 
 
+def connect_serial_port(port_path: str) -> Tuple[SoundcoreTransport, str, bytes]:
+    """Connect via a serial device node (/dev/cu.* on macOS, /dev/rfcomm* on Linux)."""
+    req_pkt = make_packet((1, 1), [])
+    fd = os.open(port_path, os.O_RDWR | getattr(os, "O_NOCTTY", 0))
+    if not IS_WINDOWS:
+        attrs = termios.tcgetattr(fd)
+        tty.setraw(fd)
+        attrs[6][termios.VMIN] = 0
+        attrs[6][termios.VTIME] = 5
+        termios.tcsetattr(fd, termios.TCSANOW, attrs)
+    transport = SoundcoreTransport(fd=fd, label=port_path)
+    try:
+        transport.sendall(req_pkt)
+        data = transport.recv(1024, timeout=2.5)
+        if len(data) >= 60 and data[0] == 0x09 and data[1] == 0xFF:
+            return transport, port_path, data
+        transport.close()
+        raise RuntimeError(f"Unexpected response from {port_path}")
+    except Exception:
+        transport.close()
+        raise
+
+
 def connect_soundcore(
-    mac: str, preferred_channel: Optional[int] = None
-) -> Tuple[socket.socket, int, bytes]:
+    target: str, preferred_channel: Optional[int] = None, serial_port: Optional[str] = None
+) -> Tuple[SoundcoreTransport, str, bytes]:
     """
-    Connect to the Soundcore RFCOMM command channel and return (socket, channel, state_packet).
-    Automatically probes channels if preferred_channel is not specified or doesn't respond to RequestState.
+    Connect to the Soundcore command interface via RFCOMM socket (Linux/Windows)
+    or serial device path (/dev/cu.* on macOS) and return (transport, channel_str, state_packet).
     """
+    if serial_port or target.startswith("/dev/"):
+        port = serial_port or target
+        return connect_serial_port(port)
+
+    if not hasattr(socket, "AF_BLUETOOTH"):
+        if IS_MACOS:
+            for path in sorted(glob.glob("/dev/cu.*")):
+                if any(k.replace(" ", "") in path.lower() for k in SOUNDCORE_KEYWORDS):
+                    return connect_serial_port(path)
+            raise RuntimeError(
+                "On macOS, pass your earbuds' Bluetooth serial port via --port /dev/cu.<DeviceName>"
+            )
+        raise RuntimeError("This Python build does not support socket.AF_BLUETOOTH. Use --port instead.")
+
     channels_to_try = []
     if preferred_channel is not None:
         channels_to_try.append(preferred_channel)
@@ -148,12 +317,12 @@ def connect_soundcore(
         s = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_STREAM, socket.BTPROTO_RFCOMM)
         s.settimeout(1.5)
         try:
-            s.connect((mac, ch))
+            s.connect((target, ch))
             s.sendall(req_pkt)
             data = s.recv(1024)
             if len(data) >= 60 and data[0] == 0x09 and data[1] == 0xFF:
                 s.settimeout(3.0)
-                return s, ch, data
+                return SoundcoreTransport(sock=s, label=f"Ch {ch}"), str(ch), data
             s.close()
         except Exception as e:
             last_err = e
@@ -163,7 +332,7 @@ def connect_soundcore(
                 pass
 
     raise RuntimeError(
-        f"Could not connect to Soundcore command channel on {mac}. "
+        f"Could not connect to Soundcore command channel on {target}. "
         f"Make sure the earbuds are out of the case and connected. (Last error: {last_err})"
     )
 
@@ -216,7 +385,7 @@ def parse_state_packet(raw: bytes) -> Dict:
     }
 
 
-def ensure_backup(mac: str, channel: int, state: Dict, backup_path: str = DEFAULT_BACKUP_FILE) -> None:
+def ensure_backup(mac: str, channel: str, state: Dict, backup_path: str = DEFAULT_BACKUP_FILE) -> None:
     """Save a backup of the device's state if no backup file exists yet."""
     if os.path.exists(backup_path):
         return
@@ -250,7 +419,7 @@ def get_base_eq_tenths(state: Dict, backup_path: str = DEFAULT_BACKUP_FILE) -> L
 
 
 def write_lr_eq(
-    sock: socket.socket,
+    transport: SoundcoreTransport,
     left_bands_tenths: List[int],
     right_bands_tenths: List[int],
     enable_hearid: bool = True,
@@ -291,11 +460,11 @@ def write_lr_eq(
         + [0]
     )
     pkt = make_packet((3, 135), body)
-    sock.sendall(pkt)
-    return sock.recv(1024)
+    transport.sendall(pkt)
+    return transport.recv(1024)
 
 
-def restore_from_backup(sock: socket.socket, backup_path: str = DEFAULT_BACKUP_FILE) -> bytes:
+def restore_from_backup(transport: SoundcoreTransport, backup_path: str = DEFAULT_BACKUP_FILE) -> bytes:
     if not os.path.exists(backup_path):
         raise FileNotFoundError(f"Backup file not found: {backup_path}")
     with open(backup_path, "r") as f:
@@ -328,12 +497,12 @@ def restore_from_backup(sock: socket.socket, backup_path: str = DEFAULT_BACKUP_F
         + [0]
     )
     pkt = make_packet((3, 135), body)
-    sock.sendall(pkt)
-    return sock.recv(1024)
+    transport.sendall(pkt)
+    return transport.recv(1024)
 
 
-def print_status_summary(mac: str, channel: int, st: Dict, base_tenths: List[int]) -> None:
-    print(f"\n[*] Soundcore Device : {mac} (RFCOMM ch {channel}, FW {st['fw_left']} / {st['fw_right']})")
+def print_status_summary(mac: str, channel: str, st: Dict, base_tenths: List[int]) -> None:
+    print(f"\n[*] Soundcore Device : {mac} (RFCOMM {channel}, FW {st['fw_left']} / {st['fw_right']})")
     print(
         f"[*] Battery Levels   : Left {st['battery_left']} | Right {st['battery_right']} | Case {st['case_battery']}"
     )
@@ -353,7 +522,20 @@ def print_status_summary(mac: str, channel: int, st: Dict, base_tenths: List[int
 
 
 def read_key() -> str:
-    """Read a single keypress or ANSI escape sequence directly from the unbuffered TTY fd."""
+    """Read a single keypress or arrow key across Linux, macOS, and Windows."""
+    if IS_WINDOWS:
+        ch = msvcrt.getch()
+        if ch in (b"\x00", b"\xe0"):
+            ch2 = msvcrt.getch()
+            win_map = {
+                b"K": "\x1b[D",  # Left
+                b"M": "\x1b[C",  # Right
+                b"H": "\x1b[A",  # Up
+                b"P": "\x1b[B",  # Down
+            }
+            return win_map.get(ch2, "")
+        return ch.decode("utf-8", errors="ignore")
+
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
     try:
@@ -364,7 +546,15 @@ def read_key() -> str:
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
 
-def run_interactive_tui(mac: str, channel: int, sock: socket.socket, st: Dict) -> None:
+def run_interactive_tui(
+    mac: str,
+    channel: str,
+    transport: SoundcoreTransport,
+    st: Dict,
+    preferred_channel: Optional[int] = None,
+    serial_port: Optional[str] = None,
+) -> None:
+    enable_windows_ansi()
     base_tenths = get_base_eq_tenths(st)
     cur_l = [int(round(x * 10)) for x in st["hearid_left_db"]]
     cur_r = [int(round(x * 10)) for x in st["hearid_right_db"]]
@@ -380,11 +570,12 @@ def run_interactive_tui(mac: str, channel: int, sock: socket.socket, st: Dict) -
         print("==========================================================================")
         print(" :: SOUNDCORE HARDWARE L/R BALANCE CALIBRATOR (Onboard DSP Flash Memory)")
         print("==========================================================================")
-        print(f" Device: {mac} (Ch {channel}) | FW: {st['fw_left']} | Battery: L {st['battery_left']} R {st['battery_right']}")
+        print(
+            f" Device: {mac} ({channel}) | FW: {st['fw_left']} | Battery: L {st['battery_left']} R {st['battery_right']}"
+        )
         print("--------------------------------------------------------------------------")
 
         diff = left_offset - right_offset
-        # Visual slider (-12 dB to +12 dB)
         pos = int(round((right_offset - left_offset + 12.0) / 24.0 * 40))
         pos = max(0, min(40, pos))
         slider = ["─"] * 41
@@ -435,10 +626,10 @@ def run_interactive_tui(mac: str, channel: int, sock: socket.socket, st: Dict) -
             changed = True
         elif key in ("r", "R"):
             try:
-                restore_from_backup(sock)
+                restore_from_backup(transport)
                 time.sleep(0.2)
-                sock.sendall(make_packet((1, 1), []))
-                st = parse_state_packet(sock.recv(1024))
+                transport.sendall(make_packet((1, 1), []))
+                st = parse_state_packet(transport.recv(1024))
                 left_offset = 0.0
                 right_offset = 0.0
                 status_msg = "[+] Restored original backup state to earbud flash memory."
@@ -454,25 +645,26 @@ def run_interactive_tui(mac: str, channel: int, sock: socket.socket, st: Dict) -
             l_tenths = [max(-120, min(120, x + l_shift)) for x in base_tenths]
             r_tenths = [max(-120, min(120, x + r_shift)) for x in base_tenths]
             try:
-                write_lr_eq(sock, l_tenths, r_tenths, enable_hearid=True)
+                write_lr_eq(transport, l_tenths, r_tenths, enable_hearid=True)
                 status_msg = f"[>>] Flashed to earbuds: Left {left_offset:+.1f} dB | Right {right_offset:+.1f} dB"
             except Exception as e:
                 status_msg = f"[!] Connection lost, reconnecting... ({e})"
-                try:
-                    sock.close()
-                except Exception:
-                    pass
-                sock, channel, _ = connect_soundcore(mac, channel)
-                write_lr_eq(sock, l_tenths, r_tenths, enable_hearid=True)
+                transport.close()
+                transport, channel, _ = connect_soundcore(mac, preferred_channel, serial_port)
+                write_lr_eq(transport, l_tenths, r_tenths, enable_hearid=True)
                 status_msg = f"[>>] Reconnected & flashed: Left {left_offset:+.1f} dB | Right {right_offset:+.1f} dB"
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Hardware-level Left/Right channel balance calibrator for Anker Soundcore earbuds."
+        description="Cross-platform hardware-level Left/Right channel balance calibrator for Anker Soundcore earbuds."
     )
-    parser.add_argument("--mac", help="Bluetooth MAC address (auto-detected if omitted)")
-    parser.add_argument("--channel", type=int, help="RFCOMM channel (auto-detected if omitted)")
+    parser.add_argument("--mac", help="Bluetooth MAC address (auto-detected on Linux/Windows/macOS if omitted)")
+    parser.add_argument("--channel", type=int, help="RFCOMM channel number (auto-probed if omitted)")
+    parser.add_argument(
+        "--port",
+        help="Serial device path for macOS/Linux (e.g. /dev/cu.soundcoreP40i or /dev/rfcomm0)",
+    )
     parser.add_argument("--status", action="store_true", help="Show current earbud hardware state")
     parser.add_argument("--json", action="store_true", help="Output state as JSON")
     parser.add_argument("--interactive", "-i", action="store_true", help="Launch live interactive TUI calibrator")
@@ -486,33 +678,34 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    mac = args.mac
+    target = args.port or args.mac
     dev_name = "Soundcore Earbuds"
-    if not mac:
+    if not target:
         found = discover_soundcore_device()
         if not found:
             sys.stderr.write(
-                "Error: No connected Soundcore device found. Connect your earbuds or specify --mac XX:XX:XX:XX:XX:XX\n"
+                "Error: No connected Soundcore device found automatically.\n"
+                "Connect your earbuds and pass --mac XX:XX:XX:XX:XX:XX (Linux/Windows) or --port /dev/cu.<Device> (macOS).\n"
             )
             sys.exit(1)
-        mac, dev_name = found
+        target, dev_name = found
 
-    sock, channel, raw_state = connect_soundcore(mac, args.channel)
+    transport, channel, raw_state = connect_soundcore(target, args.channel, args.port)
     try:
         st = parse_state_packet(raw_state)
-        ensure_backup(mac, channel, st)
+        ensure_backup(target, channel, st)
         base_tenths = [0] * 8 if args.flat_base else get_base_eq_tenths(st)
 
         if args.restore:
-            restore_from_backup(sock)
+            restore_from_backup(transport)
             time.sleep(0.25)
-            sock.sendall(make_packet((1, 1), []))
-            st = parse_state_packet(sock.recv(1024))
+            transport.sendall(make_packet((1, 1), []))
+            st = parse_state_packet(transport.recv(1024))
             if args.json:
                 print(json.dumps(st, indent=2))
             else:
                 print("[+] Original state restored to earbud hardware memory.")
-                print_status_summary(mac, channel, st, base_tenths)
+                print_status_summary(target, channel, st, base_tenths)
             return
 
         if args.left is not None or args.right is not None:
@@ -522,40 +715,36 @@ def main() -> None:
             r_shift = int(round(r_db * 10))
             l_tenths = [max(-120, min(120, x + l_shift)) for x in base_tenths]
             r_tenths = [max(-120, min(120, x + r_shift)) for x in base_tenths]
-            write_lr_eq(sock, l_tenths, r_tenths, enable_hearid=True)
+            write_lr_eq(transport, l_tenths, r_tenths, enable_hearid=True)
             time.sleep(0.25)
-            sock.sendall(make_packet((1, 1), []))
-            st = parse_state_packet(sock.recv(1024))
+            transport.sendall(make_packet((1, 1), []))
+            st = parse_state_packet(transport.recv(1024))
             if args.json:
                 print(json.dumps(st, indent=2))
             else:
                 print(
-                    f"[+] Flashed to {dev_name} ({mac}) hardware DSP: Left {l_db:+.1f} dB | Right {r_db:+.1f} dB"
+                    f"[+] Flashed to {dev_name} ({target}) hardware DSP: Left {l_db:+.1f} dB | Right {r_db:+.1f} dB"
                 )
-                print_status_summary(mac, channel, st, base_tenths)
+                print_status_summary(target, channel, st, base_tenths)
             return
 
         if args.interactive:
-            run_interactive_tui(mac, channel, sock, st)
+            run_interactive_tui(target, channel, transport, st, args.channel, args.port)
             return
 
         if args.status or args.json:
             if args.json:
                 print(json.dumps(st, indent=2))
             else:
-                print_status_summary(mac, channel, st, base_tenths)
+                print_status_summary(target, channel, st, base_tenths)
             return
 
-        # Default if no flags passed: launch interactive TUI if terminal, otherwise show status
         if sys.stdin.isatty() and sys.stdout.isatty():
-            run_interactive_tui(mac, channel, sock, st)
+            run_interactive_tui(target, channel, transport, st, args.channel, args.port)
         else:
-            print_status_summary(mac, channel, st, base_tenths)
+            print_status_summary(target, channel, st, base_tenths)
     finally:
-        try:
-            sock.close()
-        except Exception:
-            pass
+        transport.close()
 
 
 if __name__ == "__main__":

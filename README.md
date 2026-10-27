@@ -34,17 +34,20 @@ Standard Bluetooth audio profiles (A2DP/AVRCP) do not provide a way to write per
 
 ## Installation
 
-No external Python packages (`pip`) are required. The script uses Python's built-in `socket.AF_BLUETOOTH` interface and `bluetoothctl` for auto-discovery.
+No external Python packages (`pip`) are required. The tool runs out of the box on **Linux, Windows, and macOS** using only the Python standard library:
+- **Linux:** Connects via `socket.AF_BLUETOOTH` (`BTPROTO_RFCOMM`) and auto-discovers devices via `bluetoothctl`.
+- **Windows (10/11):** Connects via Winsock `socket.AF_BLUETOOTH` and auto-discovers paired Soundcore devices via PowerShell `Get-PnpDevice`.
+- **macOS:** Connects via macOS Bluetooth SPP serial device nodes (`/dev/cu.*`) and auto-discovers via `system_profiler SPBluetoothDataType`.
 
 **Requirements:**
-- Linux with BlueZ (`bluetoothctl`)
-- Python 3.8+
+- **OS:** Linux, Windows 10/11, or macOS
+- **Python:** 3.9+
 - Earbuds connected via Bluetooth and removed from the charging case
 
 ```bash
 git clone https://github.com/Baran-sys/Anker-HearID-L-R-Calibrator.git
 cd Anker-HearID-L-R-Calibrator
-chmod +x soundcore_balance.py
+python3 soundcore_balance.py
 ```
 
 ## Usage
@@ -87,8 +90,9 @@ python3 soundcore_balance.py --status --json
 # Restore the original backed-up state to the earbuds
 python3 soundcore_balance.py --restore
 
-# Manually specify Bluetooth MAC address and RFCOMM channel
+# Manually specify Bluetooth MAC address (Linux/Windows) or serial port (macOS)
 python3 soundcore_balance.py --mac 98:47:44:A6:DD:CB --channel 6 --status
+python3 soundcore_balance.py --port /dev/cu.soundcoreP40i --status
 ```
 
 | Flag | Description |
@@ -100,8 +104,9 @@ python3 soundcore_balance.py --mac 98:47:44:A6:DD:CB --channel 6 --status
 | `--status` | Print current earbud hardware state and per-band L/R DSP table |
 | `--json` | Output state information in JSON format |
 | `--restore` | Flash the original backed-up state (`backup_state.json`) back to the earbuds |
-| `--mac <MAC>` | Specify target Bluetooth MAC address (auto-detected if omitted) |
-| `--channel <INT>` | Specify target RFCOMM channel (auto-probed if omitted) |
+| `--mac <MAC>` | Specify target Bluetooth MAC address on Linux/Windows (auto-detected if omitted) |
+| `--channel <INT>` | Specify target RFCOMM channel on Linux/Windows (auto-probed if omitted) |
+| `--port <PATH>` | Specify Bluetooth serial device path on macOS/Linux (e.g. `/dev/cu.soundcoreP40i`) |
 
 ## Backup & Notes
 
