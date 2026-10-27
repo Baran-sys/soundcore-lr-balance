@@ -1,4 +1,4 @@
-# Anker HearID L/R Calibrator
+# soundcore-lr-balance
 
 Hardware-level Left/Right channel balance calibrator for Anker Soundcore earbuds.
 
@@ -45,8 +45,8 @@ No external Python packages (`pip`) are required. The tool runs out of the box o
 - Earbuds connected via Bluetooth and removed from the charging case
 
 ```bash
-git clone https://github.com/Baran-sys/Anker-HearID-L-R-Calibrator.git
-cd Anker-HearID-L-R-Calibrator
+git clone https://github.com/Baran-sys/soundcore-lr-balance.git
+cd soundcore-lr-balance
 python3 soundcore_balance.py
 ```
 
